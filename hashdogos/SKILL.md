@@ -1,51 +1,51 @@
 ---
 name: hashdogos-keccak-pow-miner
-description: 帮用户在本地 NVIDIA 显卡上挖 HashDogos 类"链上 keccak256 目标式工作量证明"的 NFT。当用户给一个要挖矿/算力才能 mint、且哈什是 keccak256 + 比较 target(不是数前导零)的项目(如 hashdogos.fun)时使用。
+description: Helps the user mine "on-chain keccak256 target-based proof-of-work" NFTs like HashDogos with a local NVIDIA GPU. Use when the user brings a project that requires mining/hashrate to mint and whose hash is keccak256 + target comparison (not leading-zero counting), e.g. hashdogos.fun.
 ---
 
-# 本地 GPU 挖矿 keccak256 目标式 PoW (HashDogos 类)
+# Local GPU mining for keccak256 target-based PoW (HashDogos-style)
 
-用户有 NVIDIA 显卡,想挖一个"链上 keccak256 PoW mint"的 NFT:本机算出满足难度的 nonce → 提交 `mine(nonce, anchorBlock)`,挖到用用户钱包提交。**每一步要么复用本仓库的 `hashdogos.py`,要么照抄该项目前端 + 一笔成功 tx,绝不瞎猜;改完内核必须用 eth_hash 复算自检、每次提交前 eth_call 模拟,通过才上链。**
+The user has an NVIDIA GPU and wants to mine an "on-chain keccak256 PoW mint" NFT: find a nonce meeting the difficulty locally → submit `mine(nonce, anchorBlock)`, submitting with the user's wallet when found. **Every step either reuses this repo's `hashdogos.py` or copies directly from the project's frontend + one successful tx — never guess. After changing the kernel, always re-verify with eth_hash self-tests and simulate with eth_call before every submission; only go on-chain once it passes.**
 
-## 和 HashBroker(SHA-256 前导零式)的区别 — 先认清楚
+## Difference from HashBroker (SHA-256 leading-zero style) — get this right first
 
-| | HashBroker 类 | **HashDogos 类(本 skill)** |
+| | HashBroker-style | **HashDogos-style (this skill)** |
 |---|---|---|
-| 哈什算法 | SHA-256 | **keccak256** (以太坊那个) |
-| 合法判据 | 前导零 bit ≥ difficulty | **hash < currentTarget(miner)** (整数比较) |
-| 难度 | 全局一个 | **每个矿工地址独立** currentTarget(miner) |
-| 预映像打包 | 紧凑拼接 | **标准 abiEncode**(每字段补齐 32 字节) |
-| 价格 | 常为免费 | **付费,且随全局供应上涨** |
+| Hash algorithm | SHA-256 | **keccak256** (the Ethereum one) |
+| Validity rule | leading zero bits ≥ difficulty | **hash < currentTarget(miner)** (integer comparison) |
+| Difficulty | one global value | **per-miner-address** currentTarget(miner) |
+| Preimage packing | tight concatenation | **standard abiEncode** (each field padded to 32 bytes) |
+| Price | usually free | **paid, rising with global supply** |
 
-认错会白挖:keccak≠sha256,target 比较≠数零,一个都不能错。
+Mixing them up wastes your hashrate: keccak≠sha256, target comparison≠zero counting — none of these can be wrong.
 
-## 环境准备
-1. 确认显卡:`nvidia-smi -L`。装依赖:`pip install pyopencl eth-account numpy eth-hash[pycryptodome]`。
-2. 让用户提供:目标合约、一笔**成功 mint 的 tx**、项目前端 URL、用于挖矿的 **burner 私钥**(只用小号,私钥只在本机环境变量,绝不外传)。
+## Environment setup
+1. Confirm the GPU: `nvidia-smi -L`. Install deps: `pip install pyopencl eth-account numpy eth-hash[pycryptodome]`.
+2. Ask the user for: target contract, one **successful mint tx**, the project's frontend URL, and a **burner private key** for mining (small wallet only; the key stays in a local environment variable and is never shared).
 
-## 逆向 PoW(照抄前端 + 成功tx,别猜)
-- **前端多是 SPA**:先 `curl` 首页拿 JS chunk 名,再拉 `/_next/.../*miner*.js`。很多项目把运行时配置放在 **`GET /api/config`**(链 id、合约地址、rpc)。
-- 前端 JS 里找预映像构造:HashDogos 是
+## Reverse-engineering the PoW (copy the frontend + a successful tx, don't guess)
+- **Frontends are usually SPAs**: `curl` the landing page to get JS chunk names, then pull `/_next/.../*miner*.js`. Many projects keep runtime config at **`GET /api/config`** (chain id, contract address, rpc).
+- Find the preimage construction in the frontend JS. HashDogos is:
   `keccak256( abiEncode([address,uint256,address,uint256,bytes32,bytes32],
-              [contract, chainId, miner, nonce, previousWork, anchor]) )`,合法 `hash < currentTarget(miner)`。
-- 解码一笔**成功 tx**:拿 `to`(合约)、`value`(=mintPrice,注意付费)、selector、参数。HashDogos 提交 `mine(uint256 nonce, uint256 anchorBlock)`,selector `0x071e9503`。
-- 合约读函数:`mintPrice()`、`previousWork()`(bytes32,每次有人 mint 就变)、`currentAnchor()`→(anchorBlock, anchor)、`currentTarget(address)`。选择器 = `keccak(sig)[:4]`,别记死,自己算。
-- **验证布局**:随便一个 nonce,`eth_hash.keccak(preimage)` 复算;真正的权威验证是**提交前 `eth_call` 模拟 `mine(...)`**——错的解/布局会 revert,零成本证伪。对上了(模拟不 revert)才动手。
+              [contract, chainId, miner, nonce, previousWork, anchor]) )`, valid when `hash < currentTarget(miner)`.
+- Decode one **successful tx**: get `to` (contract), `value` (=mintPrice, note this is paid), selector, args. HashDogos submits `mine(uint256 nonce, uint256 anchorBlock)`, selector `0x071e9503`.
+- Contract view functions: `mintPrice()`, `previousWork()` (bytes32, changes on every mint), `currentAnchor()` → (anchorBlock, anchor), `currentTarget(address)`. Selectors = `keccak(sig)[:4]` — compute them, don't memorize.
+- **Verify the layout**: recompute `eth_hash.keccak(preimage)` for any nonce; the authoritative check is **pre-submit `eth_call` simulation of `mine(...)`** — a wrong solution/layout reverts, disproven at zero cost. Only proceed once the simulation doesn't revert.
 
-## 挖矿器(OpenCL keccak256,实测 5090 ~1.2 GH/s)
-> 本目录已有成品 **`hashdogos.py`**(自包含:OpenCL keccak256 + 首启自检 + 模拟闸 + 锁价 + 花费上限 + 提交)。**优先直接用它**,只改顶部 `CONTRACT / CHAIN_ID / SEL`(合约和选择器)和 preimage 布局。
+## The miner (OpenCL keccak256, measured ~1.2 GH/s on a 5090)
+> This directory ships a ready-made **`hashdogos.py`** (self-contained: OpenCL keccak256 + first-launch self-test + simulation gate + price lock + spend cap + submission). **Prefer using it directly** — only change the top-level `CONTRACT / CHAIN_ID / SEL` (contract and selectors) and the preimage layout.
 
-内核要点(要自己写时):192 字节预映像 = 2 个 keccak 块(rate 136):块2 padding 是 keccak 的 `0x01`…`0x80`(不是 SHA3 的 0x06)。只 nonce 变(abiEncode 里 word3),其余 lane 烘成常量。合法判据用 `bswap64(state[0]) < (target>>192)`——因为 target 低位全是 f,高 64 位小于就整数小于,数学严格。keccak 比 SHA-256 慢很多(2 次 24 轮置换),2^32 目标 5090 上约几秒一个。
+Kernel essentials (if writing your own): the 192-byte preimage = 2 keccak blocks (rate 136); block-2 padding is keccak's `0x01`…`0x80` (not SHA3's 0x06). Only the nonce changes (word3 in the abiEncode) — bake every other lane in as constants. Validity check via `bswap64(state[0]) < (target>>192)` — because the target's low bits are all f, a smaller high-64 means a smaller integer; mathematically exact. keccak is much slower than SHA-256 (2× 24-round permutations); a 2^32 target takes a few seconds on a 5090.
 
-## 主循环 + 安全闸(hashdogos.py 已内置,自己写也照做)
-- **付费提醒**:mint 要花真钱(每个 mintPrice ETH),且价格随供应上涨。**先把价格和总花费算给用户、让用户确认**再开火。付费=购买。
-- **锁价**:`PRICE_LOCK=<wei>`——价格一变就停,绝不偷偷按新高价多花。
-- **花费上限**:`CAP_ETH`——超了就停。
-- **干跑优先**:不设 `DO=1` 时只挖+模拟不发交易,先跑一遍确认内核自检过、模拟过,再 `DO=1` 真发。
-- 每轮:读 price/previousWork/anchor/currentTarget → GPU 挖 → 本地 eth_hash 复算 → **eth_call 模拟**(anchor 有新鲜窗口,过期会 revert,重读重挖)→ 签 `mine(nonce,anchorBlock)` value=price 发出 → 成功后 previousWork 变了,重读再挖下一个。
-- **RPC 请求必须带 `user-agent` 头**(无 UA 常 403)。提交钱包要有足够 gas + mint 款,先充。
+## Main loop + safety gates (built into hashdogos.py; follow the same pattern if writing your own)
+- **Paid-project warning**: minting spends real money (mintPrice ETH each), and the price rises with supply. **Compute the price and total cost for the user and get their confirmation before firing.** Paying = buying.
+- **Price lock**: `PRICE_LOCK=<wei>` — stop the moment the price changes; never quietly pay more at the new price.
+- **Spend cap**: `CAP_ETH` — stop when exceeded.
+- **Dry run first**: without `DO=1`, only mine + simulate, no transactions. Run once to confirm the kernel self-test and simulation pass, then `DO=1` for real.
+- Each round: read price/previousWork/anchor/currentTarget → GPU mine → recompute locally with eth_hash → **eth_call simulate** (the anchor has a freshness window; expired reverts → re-read and re-mine) → sign `mine(nonce,anchorBlock)` with value=price and send → after success, previousWork changed: re-read and mine the next one.
+- **RPC requests must include a `user-agent` header** (no UA often gets 403). The submitting wallet needs enough for gas + the mint price; top it up first.
 
-## 安全红线(必须遵守)
-- 只用 **burner 小号**私钥;私钥只在本机环境变量,绝不外传/贴群。脚本只"读合约 + 算 keccak + 提交 mine",不转账、不签别的。
-- ⚠️ **拒绝变种骗局**:若项目让你跑**它给的可执行文件**,或用**它给的公钥**去磨 vanity 地址(如 `profanity2 -z <公钥>`)——那是替骗子磨私钥 + 骗你充值,坚决不碰。只跑看得懂的开源脚本、只用自己的钱包。
-- 付费项目务必**锁价 + 设花费上限 + 先干跑**,别让一个价格/难度突变把钱花超。
+## Safety rules (must follow)
+- Use a **burner** private key only; the key stays in a local environment variable and is never shared or pasted anywhere. The script only does "read contract + compute keccak + submit mine".
+- ⚠️ **Reject variant scams**: if a project tells you to run **its executable**, or grind a vanity address with **its public key** (e.g. `profanity2 -z <pubkey>`) — that's grinding a private key for the scammer + baiting you to deposit. Hard pass. Only run open-source scripts you can read, only with your own wallet.
+- For paid projects, always **lock the price + set a spend cap + dry run first** so a price/difficulty spike can't overspend.
