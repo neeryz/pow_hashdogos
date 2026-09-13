@@ -79,12 +79,17 @@ def keccak_hi64(prevWork, anchor, nonce):
     h = keccak(preimage(prevWork, anchor, nonce)); return h, int.from_bytes(h[:8], "big")
 
 # ---- OpenCL keccak256 (only the nonce changes: word3=lane15=bswap64(nonce)) ----
-dev = None
+# Multi-GPU: every device on every platform is used, one thread per GPU.
+GPUS = []
 for p in cl.get_platforms():
-    if "NVIDIA" in p.name: dev = p.get_devices()[0]; break
-if dev is None: dev = cl.get_platforms()[0].get_devices()[0]
-ctx = cl.Context([dev]); q = cl.CommandQueue(ctx)
-print(f"GPU: {dev.name} {dev.max_compute_units}CU  wallet {ADDR}", flush=True)
+    for d in p.get_devices():
+        GPUS.append(d)
+if not GPUS: sys.exit("❌ no OpenCL devices found")
+CTXS = {d: cl.Context([d]) for d in GPUS}
+print(f"GPUs: {len(GPUS)}  wallet {ADDR}", flush=True)
+for i, d in enumerate(GPUS):
+    print(f"  [gpu{i}] {d.name} {d.max_compute_units}CU", flush=True)
+
 
 KSRC = r"""
 __constant ulong RC[24]={0x0000000000000001UL,0x0000000000008082UL,0x800000000000808aUL,0x8000000080008000UL,
@@ -130,8 +135,17 @@ __kernel void mine(ulong base,__global volatile int* found,__global ulong* out,_
 }
 """
 ITERS = 1024
-def mine(prevWork, anchor, tgt, stale, max_s=180):
-    lanes = lanes_for(prevWork, anchor); THI = tgt >> 192   # valid <=> hash high-64 < target high-64 (target low bits are all f; exact)
+
+# ---- multi-GPU mining: one thread per GPU, disjoint nonce ranges ----
+import threading
+from collections import namedtuple
+
+GpuState = namedtuple("GpuState", "dev ctx q prg ker fg og dg found out dbg")
+
+def gpu_worker(idx, dev, prevWork, anchor, tgt, base, stop_evt, result, stats, t_start):
+    """Runs on its own thread. Writes (nonce) into result[0] when found. stats[idx] = hashes done."""
+    ctx = CTXS[dev]; q = cl.CommandQueue(ctx)
+    lanes = lanes_for(prevWork, anchor); THI = tgt >> 192   # valid <=> hash high-64 < target high-64 (exact)
     src = (KSRC.replace("__LANES__", ",".join(f"{l}UL" for l in lanes))
                .replace("__ITERS__", str(ITERS)).replace("__THI__", f"{THI}UL"))
     prg = cl.Program(ctx, src).build()
@@ -141,21 +155,55 @@ def mine(prevWork, anchor, tgt, stale, max_s=180):
     dg = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=dbg)
     ker = cl.Kernel(prg, "mine")
     GLOBAL = 1 << 20; per = GLOBAL * ITERS
-    base = int.from_bytes(os.urandom(6), "big"); t0 = time.time(); tot = 0; last = t0; checked = False
-    while True:
-        ker(q, (GLOBAL,), None, np.uint64(base), fg, og, dg); q.finish()
-        cl.enqueue_copy(q, found, fg); cl.enqueue_copy(q, dbg, dg); q.finish()
-        if not checked:  # self-test: GPU keccak must match eth_hash bit-for-bit, otherwise exit
-            ref = keccak_hi64(prevWork, anchor, base)[0]; ref_l0 = int.from_bytes(ref[:8], "little")
-            if int(dbg[0]) != ref_l0: raise SystemExit(f"❌ keccak kernel self-test FAILED! {int(dbg[0]):#018x} != {ref_l0:#018x}")
-            print(f"  ✓ keccak kernel self-test passed (lane0={ref_l0:#018x})", flush=True); checked = True
-        tot += per; base = (base + per) & ((1 << 64) - 1); now = time.time()
-        if found[0]:
-            cl.enqueue_copy(q, out, og); q.finish(); return int(out[0])
-        if now - last >= 5:
-            print(f"  {tot/(now-t0)/1e9:.2f} GH/s  searched {tot/1e9:.1f}e9 (expected {(2**256)/tgt/1e9:.1f}e9)", flush=True); last = now
-        if stale(): print("  challenge changed → re-mining", flush=True); return None
-        if now - t0 > max_s: print("  timed out; re-reading state and re-mining", flush=True); return None
+    checked = False; last_report = time.time()
+    try:
+        while not stop_evt.is_set() and not result[0]:
+            ker(q, (GLOBAL,), None, np.uint64(base), fg, og, dg); q.finish()
+            cl.enqueue_copy(q, found, fg); cl.enqueue_copy(q, dbg, dg); q.finish()
+            if not checked:  # self-test: GPU keccak must match eth_hash bit-for-bit, otherwise abort all
+                ref = keccak_hi64(prevWork, anchor, base)[0]; ref_l0 = int.from_bytes(ref[:8], "little")
+                if int(dbg[0]) != ref_l0:
+                    print(f"  ❌ [gpu{idx}] keccak kernel self-test FAILED! {int(dbg[0]):#018x} != {ref_l0:#018x}", flush=True)
+                    result[1] = f"gpu{idx} self-test failed"; stop_evt.set(); return
+                print(f"  ✓ [gpu{idx}] keccak kernel self-test passed (lane0={ref_l0:#018x})", flush=True); checked = True
+            stats[idx] += per; base = (base + per) & ((1 << 64) - 1)
+            if found[0]:
+                cl.enqueue_copy(q, out, og); q.finish()
+                result[0] = int(out[0]); stop_evt.set(); return
+            now = time.time()
+            if now - last_report >= 5:
+                tot = sum(stats); print(f"  {tot/(now-t_start)/1e9:.2f} GH/s total · searched {tot/1e9:.1f}e9 (expected {(2**256)/tgt/1e9:.1f}e9)", flush=True)
+                last_report = now
+    except Exception as e:
+        print(f"  [gpu{idx}] error: {e}", flush=True)
+        result[1] = f"gpu{idx}: {e}"; stop_evt.set()
+
+def mine(prevWork, anchor, tgt, stale, max_s=180):
+    stop_evt = threading.Event()
+    result = [None, None]          # [winning nonce or None, error or None]
+    stats = [0] * len(GPUS)
+    t_start = time.time()
+    SPACE = 1 << 57                # disjoint nonce space per GPU (no overlap, no double work)
+    base0 = int.from_bytes(os.urandom(6), "big")
+    threads = []
+    for idx, dev in enumerate(GPUS):
+        t = threading.Thread(target=gpu_worker,
+                             args=(idx, dev, prevWork, anchor, tgt, (base0 + idx * SPACE) & ((1 << 64) - 1),
+                                   stop_evt, result, stats, t_start), daemon=True)
+        t.start(); threads.append(t)
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.3)
+            now = time.time()
+            if result[0] is not None or result[1]: break
+            if stale(): print("  challenge changed → re-mining", flush=True); stop_evt.set(); return None
+            if now - t_start > max_s: print("  timed out; re-reading state and re-mining", flush=True); stop_evt.set(); return None
+    finally:
+        stop_evt.set()
+        for t in threads: t.join(timeout=5)
+    if result[1]: raise SystemExit(f"❌ {result[1]}")
+    return result[0]
+
 
 def encode_mine(nonce, anchorBlock):
     return SEL["mine"] + int(nonce).to_bytes(32, "big").hex() + int(anchorBlock).to_bytes(32, "big").hex()

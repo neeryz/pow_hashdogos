@@ -40,7 +40,7 @@ Environment variables:
 - `CAP_ETH` — total spend cap; stops when exceeded.
 - `DO=1` — **transactions are only sent when this is set**; without it = mine + simulate only, zero spending.
 
-Measured on an RTX 5090: ≈ 1.2 GH/s keccak256 (slower than SHA-256 because each hash needs 2 keccak permutations).
+Measured on an RTX 5090: ≈ 1.2 GH/s keccak256 per card (slower than SHA-256 because each hash needs 2 keccak permutations). **Multi-GPU is supported**: every OpenCL device found is used automatically — one thread per GPU with disjoint nonce ranges, so N cards ≈ N× the hashrate.
 
 To repurpose for a similar project: edit `CONTRACT / CHAIN_ID / SEL` at the top of `hashdogos.py` (contract address + selectors, reverse-engineered from the project's frontend `/api/config` + one successful tx — don't guess), and verify the preimage layout against the frontend.
 
